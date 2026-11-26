@@ -1,4 +1,12 @@
-import type { IntegrationJob, RetryResponse, SessionId, SessionInfo, StubConfig, VenueId } from './types';
+import type {
+  IntegrationJob,
+  RetryResponse,
+  SessionId,
+  SessionInfo,
+  SimulateTickResponse,
+  StubConfig,
+  VenueId,
+} from './types';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -83,8 +91,8 @@ export function fetchJobs(venueId?: string, signal?: AbortSignal): Promise<{ ite
     params.set('venueId', venueId);
   }
   const query = params.toString();
-  const path = query ? `/api/jobs?${query}` : '/api/jobs';
-  return requestJson<{ items: IntegrationJob[] }>(path, {
+  const url = query ? `/api/jobs?${query}` : '/api/jobs';
+  return requestJson<{ items: IntegrationJob[] }>(url, {
     cache: 'no-store',
     signal,
   });
@@ -109,13 +117,16 @@ export function fetchStubConfig(): Promise<StubConfig> {
   });
 }
 
-export function updateStubConfig(patch: Partial<{
-  delayMs: number;
-  delayVenueId: VenueId | null;
-  force500: boolean;
-  force500Remaining: number;
-  neverComplete: boolean;
-}>): Promise<StubConfig> {
+export function updateStubConfig(
+  patch: Partial<{
+    delayMs: number;
+    delayVenueId: VenueId | null;
+    force500: boolean;
+    force500Remaining: number;
+    neverComplete: boolean;
+    forceRetryFail: boolean;
+  }>,
+): Promise<StubConfig> {
   return requestJson<StubConfig>('/api/stub/config', {
     method: 'POST',
     body: JSON.stringify(patch),
@@ -125,5 +136,17 @@ export function updateStubConfig(patch: Partial<{
 export function resetStubFixtures(): Promise<{ status: string; config: StubConfig }> {
   return requestJson<{ status: string; config: StubConfig }>('/api/stub/reset', {
     method: 'POST',
+  });
+}
+
+export function simulateLiveTick(venueId?: string, signal?: AbortSignal): Promise<SimulateTickResponse> {
+  return requestJson<SimulateTickResponse>('/api/stub/simulate-tick', {
+    method: 'POST',
+    body: JSON.stringify({
+      venueId: venueId ?? 'ALL',
+      minCount: 1,
+      maxCount: 3,
+    }),
+    signal,
   });
 }

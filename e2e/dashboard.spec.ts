@@ -181,4 +181,51 @@ test.describe('Integration Health Dashboard E2E', () => {
     await rowJ1.getByRole('button', { name: 'Retry', exact: true }).click();
     await expect(rowJ1.locator('[data-status="HEALTHY"]')).toBeVisible({ timeout: 5000 });
   });
+
+  test('7. Live simulation (1-3 jobs/sec while open) and 3x escalating retry limit', async ({
+    page,
+    request,
+  }) => {
+    await page.goto('/');
+    await expect(page.getByRole('cell', { name: 'Mock POS', exact: true })).toBeVisible();
+
+    const liveBtn = page.getByRole('button', { name: /Live Sim:/i });
+    await expect(liveBtn).toContainText(/Live Sim: ON/i);
+
+    await page.waitForTimeout(2300);
+    const countWhileOpen = await page.locator('tbody tr').count();
+    expect(countWhileOpen).toBeGreaterThanOrEqual(4);
+    expect(await page.locator('tbody tr', { hasText: /sim-/i }).count()).toBeGreaterThanOrEqual(2);
+
+    await liveBtn.click();
+    await expect(liveBtn).toContainText(/Live Sim: PAUSED/i);
+    const countAtPause = await page.locator('tbody tr').count();
+    await page.waitForTimeout(1400);
+    expect(await page.locator('tbody tr').count()).toBe(countAtPause);
+
+    await page.getByRole('button', { name: 'Reset Fixtures' }).click();
+    await expect(page.locator('tbody tr')).toHaveCount(2);
+
+    // Verify 3x max retry enforcement deterministically with forceRetryFail
+    const cfgRes = await request.post('/api/stub/config', {
+      data: { forceRetryFail: true },
+    });
+    expect(cfgRes.ok()).toBe(true);
+
+    const rowJ1 = page.locator('tbody tr', { hasText: 'Mock POS' });
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      await rowJ1.getByRole('button', { name: 'Retry', exact: true }).click();
+      await expect(rowJ1.locator('[data-status="QUEUED"]')).toBeVisible();
+      await expect(rowJ1.locator('[data-status="FAILED"]')).toBeVisible({ timeout: 5000 });
+    }
+
+    await expect(rowJ1.getByText('Max 3/3')).toBeVisible();
+    await rowJ1.getByRole('button', { name: /Select job j1/i }).click();
+    await expect(page.getByRole('button', { name: 'Max Retries Reached (3/3)' })).toBeDisabled();
+
+    const blockedRetry = await request.post('/api/jobs/j1/retry', {
+      headers: { Authorization: 'Bearer operator-A' },
+    });
+    expect(blockedRetry.status()).toBe(409);
+  });
 });

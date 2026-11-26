@@ -11,21 +11,27 @@ import {
   resetStubFixtures,
   retryJob,
   selectSyntheticSession,
+  simulateLiveTick,
   updateStubConfig,
 } from '@/lib/api-client';
 import { formatUtcTimestamp } from '@/lib/format';
-import type {
-  DashboardNotice,
-  IntegrationJob,
-  PollState,
-  SessionId,
-  SessionInfo,
-  StubConfig,
+import {
+  MAX_RETRY_ATTEMPTS,
+  POLL_BACKOFF_SCHEDULE_MS,
+  RETRY_BACKOFF_SCHEDULE_MS,
+  type DashboardNotice,
+  type IntegrationJob,
+  type PollState,
+  type ScheduledRetryState,
+  type SessionId,
+  type SessionInfo,
+  type StubConfig,
 } from '@/lib/types';
 import { StatusBadge } from './StatusBadge';
 
-export const POLL_INTERVAL_MS = 350;
-export const MAX_POLL_ATTEMPTS = 5;
+export const LIVE_SIM_TICK_MS = 1000;
+export const MAX_POLL_ATTEMPTS = POLL_BACKOFF_SCHEDULE_MS.length;
+const MAX_CONCURRENT_AUTO_RETRIES = 3;
 
 const DEFAULT_STUB_CONFIG: StubConfig = {
   delayMs: 0,
@@ -33,6 +39,7 @@ const DEFAULT_STUB_CONFIG: StubConfig = {
   force500: false,
   force500Remaining: 0,
   neverComplete: false,
+  forceRetryFail: false,
 };
 
 function sleep(ms: number): Promise<void> {
@@ -45,6 +52,13 @@ function getInitialVenueParam(): string {
   }
   const param = new URLSearchParams(window.location.search).get('venueId');
   return param && param.trim().length > 0 ? param.trim() : 'ALL';
+}
+
+function formatDelayLabel(delayMs: number | null | undefined): string {
+  if (!delayMs || delayMs <= 0) {
+    return '0s';
+  }
+  return delayMs >= 1000 ? `${delayMs / 1000}s` : `${delayMs}ms`;
 }
 
 type StubPreset = 'normal' | 'delay' | 'forced500' | 'neverComplete';
@@ -80,18 +94,91 @@ export function IntegrationDashboard() {
   const [submittingJobIds, setSubmittingJobIds] = useState<ReadonlySet<string>>(new Set());
   const [pollStates, setPollStates] = useState<Record<string, PollState>>({});
 
+  // Live frontend-only simulation & escalating 3x auto-retry states
+  const [liveSimEnabled, setLiveSimEnabled] = useState<boolean>(true);
+  const [autoRetryEnabled, setAutoRetryEnabled] = useState<boolean>(true);
+  const [isPageVisible, setIsPageVisible] = useState<boolean>(true);
+  const [lastTickCount, setLastTickCount] = useState<number>(0);
+  const [totalSimulated, setTotalSimulated] = useState<number>(0);
+  const [scheduledRetries, setScheduledRetries] = useState<Record<string, ScheduledRetryState>>({});
+
   const jobsRequestSeqRef = useRef<number>(0);
   const jobsAbortRef = useRef<AbortController | null>(null);
+  const simAbortRef = useRef<AbortController | null>(null);
   const retryInFlightRef = useRef<Set<string>>(new Set());
   const pollGenerationRef = useRef<Record<string, number>>({});
+  const pollStatesRef = useRef<Record<string, PollState>>({});
+  const autoRetryTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const mountedRef = useRef<boolean>(true);
+  const isRefreshingRef = useRef<boolean>(false);
+
+  pollStatesRef.current = pollStates;
+  isRefreshingRef.current = isRefreshing;
+
+  const clearScheduledAutoRetry = useCallback((jobId: string) => {
+    const existingTimer = autoRetryTimersRef.current.get(jobId);
+    if (existingTimer !== undefined) {
+      clearTimeout(existingTimer);
+      autoRetryTimersRef.current.delete(jobId);
+    }
+    setScheduledRetries((prev) => {
+      if (!(jobId in prev)) {
+        return prev;
+      }
+      const next = { ...prev };
+      delete next[jobId];
+      return next;
+    });
+  }, []);
+
+  const clearAllAutoRetries = useCallback(() => {
+    for (const timer of autoRetryTimersRef.current.values()) {
+      clearTimeout(timer);
+    }
+    autoRetryTimersRef.current.clear();
+    setScheduledRetries({});
+  }, []);
 
   const cancelAllPolls = useCallback(() => {
     for (const jobId of Object.keys(pollGenerationRef.current)) {
       pollGenerationRef.current[jobId] = (pollGenerationRef.current[jobId] ?? 0) + 1;
     }
     setPollStates({});
-  }, []);
+    clearAllAutoRetries();
+  }, [clearAllAutoRetries]);
+
+  // Track browser visibility and teardown so simulation runs ONLY while page is open & visible.
+  useEffect(() => {
+    if (typeof document === 'undefined') {
+      return;
+    }
+    setIsPageVisible(document.visibilityState === 'visible');
+
+    const handleVisibilityChange = () => {
+      const visible = document.visibilityState === 'visible';
+      setIsPageVisible(visible);
+      if (!visible) {
+        simAbortRef.current?.abort();
+        clearAllAutoRetries();
+      }
+    };
+
+    const handleUnloadOrHide = () => {
+      setIsPageVisible(false);
+      simAbortRef.current?.abort();
+      clearAllAutoRetries();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handleUnloadOrHide);
+    window.addEventListener('beforeunload', handleUnloadOrHide);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handleUnloadOrHide);
+      window.removeEventListener('beforeunload', handleUnloadOrHide);
+    };
+  }, [clearAllAutoRetries]);
 
   const loadHealth = useCallback(async () => {
     try {
@@ -217,9 +304,14 @@ export function IntegrationDashboard() {
     return () => {
       mountedRef.current = false;
       jobsAbortRef.current?.abort();
+      simAbortRef.current?.abort();
       for (const jobId of Object.keys(pollGenerationRef.current)) {
         pollGenerationRef.current[jobId] = (pollGenerationRef.current[jobId] ?? 0) + 1;
       }
+      for (const timer of autoRetryTimersRef.current.values()) {
+        clearTimeout(timer);
+      }
+      autoRetryTimersRef.current.clear();
     };
   }, [loadHealth, loadJobs]);
 
@@ -247,12 +339,20 @@ export function IntegrationDashboard() {
           return;
         }
 
+        const backoffMs =
+          POLL_BACKOFF_SCHEDULE_MS[attempt - 1] ?? 2400;
+
         setPollStates((prev) => ({
           ...prev,
-          [jobId]: { kind: 'polling', attempt, maxAttempts: MAX_POLL_ATTEMPTS },
+          [jobId]: {
+            kind: 'polling',
+            attempt,
+            maxAttempts: MAX_POLL_ATTEMPTS,
+            backoffMs,
+          },
         }));
 
-        await sleep(POLL_INTERVAL_MS);
+        await sleep(backoffMs);
 
         if (!mountedRef.current || pollGenerationRef.current[jobId] !== nextGeneration) {
           return;
@@ -274,6 +374,9 @@ export function IntegrationDashboard() {
 
           if (detail.status === 'FAILED') {
             setPollStates((prev) => ({ ...prev, [jobId]: { kind: 'idle' } }));
+            setLiveAnnouncement(
+              `Retry ${detail.retryCount ?? 1}/${detail.maxRetries ?? MAX_RETRY_ATTEMPTS} failed for job ${jobId}.`,
+            );
             return;
           }
         } catch (err) {
@@ -303,6 +406,7 @@ export function IntegrationDashboard() {
   const handleSessionChange = useCallback(
     async (value: string) => {
       cancelAllPolls();
+      simAbortRef.current?.abort();
       retryInFlightRef.current.clear();
       setSubmittingJobIds(new Set());
       setSelectedVenue('ALL');
@@ -328,18 +432,22 @@ export function IntegrationDashboard() {
 
   const handleVenueChange = useCallback(
     async (venue: string) => {
+      simAbortRef.current?.abort();
+      clearAllAutoRetries();
       setSelectedVenue(venue);
       await loadJobs(venue);
     },
-    [loadJobs],
+    [clearAllAutoRetries, loadJobs],
   );
 
   const handleRetry = useCallback(
     async (jobId: string) => {
+      clearScheduledAutoRetry(jobId);
+
       if (retryInFlightRef.current.has(jobId)) {
         return;
       }
-      const existingPoll = pollStates[jobId];
+      const existingPoll = pollStatesRef.current[jobId];
       if (existingPoll?.kind === 'polling') {
         return;
       }
@@ -352,15 +460,44 @@ export function IntegrationDashboard() {
         await retryJob(jobId);
         setJobs((prev) =>
           prev
-            ? prev.map((item) =>
-                item.id === jobId ? { ...item, status: 'QUEUED' } : item,
-              )
+            ? prev.map((item) => {
+                if (item.id !== jobId) {
+                  return item;
+                }
+                const nextRetryCount = Math.min(
+                  (item.retryCount ?? 0) + 1,
+                  item.maxRetries ?? MAX_RETRY_ATTEMPTS,
+                );
+                return {
+                  ...item,
+                  status: 'QUEUED',
+                  retryCount: nextRetryCount,
+                  nextRetryDelayMs: null,
+                };
+              })
             : prev,
         );
         setLiveAnnouncement(`Retry queued for job ${jobId}.`);
         void startBoundedPolling(jobId);
       } catch (err) {
-        if (err instanceof ApiError && err.status === 409) {
+        if (err instanceof ApiError && err.code === 'MAX_RETRIES_EXCEEDED') {
+          setJobs((prev) =>
+            prev
+              ? prev.map((item) =>
+                  item.id === jobId
+                    ? {
+                        ...item,
+                        status: 'FAILED',
+                        retryCount: MAX_RETRY_ATTEMPTS,
+                        maxRetries: MAX_RETRY_ATTEMPTS,
+                        nextRetryDelayMs: null,
+                      }
+                    : item,
+                )
+              : prev,
+          );
+          setNotice({ kind: 'info', message: err.message });
+        } else if (err instanceof ApiError && err.status === 409) {
           setJobs((prev) =>
             prev
               ? prev.map((item) =>
@@ -369,7 +506,7 @@ export function IntegrationDashboard() {
               : prev,
           );
           setNotice({ kind: 'info', message: err.message });
-          if (pollStates[jobId]?.kind !== 'polling') {
+          if (pollStatesRef.current[jobId]?.kind !== 'polling') {
             void startBoundedPolling(jobId);
           }
         } else if (err instanceof ApiError) {
@@ -387,7 +524,7 @@ export function IntegrationDashboard() {
         }
       }
     },
-    [pollStates, startBoundedPolling],
+    [clearScheduledAutoRetry, startBoundedPolling],
   );
 
   const handleCheckStatusOnce = useCallback(
@@ -415,10 +552,19 @@ export function IntegrationDashboard() {
 
   const handleSelectStubPreset = useCallback(
     async (preset: StubPreset) => {
+      simAbortRef.current?.abort();
+      clearAllAutoRetries();
       setNotice({ kind: 'none' });
       let patch: Partial<StubConfig>;
       if (preset === 'normal') {
-        patch = { delayMs: 0, delayVenueId: null, force500: false, force500Remaining: 0, neverComplete: false };
+        patch = {
+          delayMs: 0,
+          delayVenueId: null,
+          force500: false,
+          force500Remaining: 0,
+          neverComplete: false,
+          forceRetryFail: false,
+        };
       } else if (preset === 'delay') {
         patch = { delayMs: 1200, delayVenueId: 'A1', force500: false, force500Remaining: 0, neverComplete: false };
       } else if (preset === 'forced500') {
@@ -437,13 +583,16 @@ export function IntegrationDashboard() {
         await loadJobs(selectedVenue);
       }
     },
-    [loadJobs, selectedVenue],
+    [clearAllAutoRetries, loadJobs, selectedVenue],
   );
 
   const handleResetFixtures = useCallback(async () => {
+    simAbortRef.current?.abort();
     cancelAllPolls();
     retryInFlightRef.current.clear();
     setSubmittingJobIds(new Set());
+    setLastTickCount(0);
+    setTotalSimulated(0);
     const result = await resetStubFixtures();
     if (!mountedRef.current) {
       return;
@@ -453,6 +602,178 @@ export function IntegrationDashboard() {
     await loadJobs(selectedVenue);
   }, [cancelAllPolls, loadJobs, selectedVenue]);
 
+  const activePreset = getActivePreset(stubConfig);
+  const canRunLiveSim =
+    liveSimEnabled &&
+    isPageVisible &&
+    session !== null &&
+    activePreset === 'normal' &&
+    notice.kind === 'none' &&
+    !isInitialLoading;
+
+  // Live simulation loop: creates 1-3 random jobs/sec strictly while frontend tab is open & visible.
+  useEffect(() => {
+    if (!canRunLiveSim) {
+      simAbortRef.current?.abort();
+      return;
+    }
+
+    let cancelled = false;
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+
+    const runTick = async () => {
+      if (cancelled || !mountedRef.current) {
+        return;
+      }
+
+      const hasActivePoll = Object.values(pollStatesRef.current).some((state) => state.kind === 'polling');
+      if (isRefreshingRef.current || retryInFlightRef.current.size > 0 || hasActivePoll) {
+        if (!cancelled) {
+          timerId = setTimeout(() => void runTick(), LIVE_SIM_TICK_MS);
+        }
+        return;
+      }
+
+      const tickSeq = jobsRequestSeqRef.current;
+      const controller = new AbortController();
+      simAbortRef.current = controller;
+
+      try {
+        const res = await simulateLiveTick(selectedVenue, controller.signal);
+        if (cancelled || !mountedRef.current || controller.signal.aborted || tickSeq !== jobsRequestSeqRef.current) {
+          return;
+        }
+
+        setJobs((prev) => {
+          const prevMap = new Map((prev ?? []).map((item) => [item.id, item]));
+          return res.items.map((item) => {
+            const existing = prevMap.get(item.id);
+            const activePoll = pollStatesRef.current[item.id]?.kind === 'polling';
+            if ((retryInFlightRef.current.has(item.id) || activePoll) && existing) {
+              return existing;
+            }
+            return item;
+          });
+        });
+        setLastUpdatedAt(new Date().toISOString());
+        setLastTickCount(res.generatedCount);
+        setTotalSimulated((prev) => prev + res.generatedCount);
+      } catch (err) {
+        if (controller.signal.aborted || cancelled) {
+          return;
+        }
+        // Ignore 404 from unit-test mocks that only stub baseline endpoints.
+        if (err instanceof ApiError && err.status !== 404) {
+          if (err.status === 401) {
+            setNotice({ kind: 'unauthorized', message: err.message });
+            return;
+          }
+          if (err.status === 403) {
+            setNotice({ kind: 'forbidden', message: err.message });
+            return;
+          }
+        }
+      } finally {
+        if (!cancelled && mountedRef.current) {
+          timerId = setTimeout(() => void runTick(), LIVE_SIM_TICK_MS);
+        }
+      }
+    };
+
+    timerId = setTimeout(() => void runTick(), LIVE_SIM_TICK_MS);
+
+    return () => {
+      cancelled = true;
+      if (timerId !== null) {
+        clearTimeout(timerId);
+      }
+      simAbortRef.current?.abort();
+    };
+  }, [canRunLiveSim, selectedVenue]);
+
+  // Escalating Auto-Retry Scheduler (1s -> 2s -> 4s, max 3x) for simulated FAILED jobs when operator & live sim active.
+  useEffect(() => {
+    const canAutoRetry =
+      canRunLiveSim && autoRetryEnabled && session?.role === 'operator' && jobs !== null;
+
+    if (!canAutoRetry) {
+      clearAllAutoRetries();
+      return;
+    }
+
+    const activeIds = new Set(jobs.map((job) => job.id));
+    for (const scheduledId of Array.from(autoRetryTimersRef.current.keys())) {
+      const target = jobs.find((item) => item.id === scheduledId);
+      if (
+        !activeIds.has(scheduledId) ||
+        !target ||
+        target.status !== 'FAILED' ||
+        (target.retryCount ?? 0) >= (target.maxRetries ?? MAX_RETRY_ATTEMPTS)
+      ) {
+        clearScheduledAutoRetry(scheduledId);
+      }
+    }
+
+    let queuedOrScheduled = autoRetryTimersRef.current.size;
+
+    for (const job of jobs) {
+      if (!job.isSimulated || job.status !== 'FAILED') {
+        continue;
+      }
+      const attemptsSoFar = job.retryCount ?? 0;
+      const maxAttempts = job.maxRetries ?? MAX_RETRY_ATTEMPTS;
+      if (attemptsSoFar >= maxAttempts) {
+        continue;
+      }
+      if (
+        retryInFlightRef.current.has(job.id) ||
+        pollStatesRef.current[job.id]?.kind === 'polling' ||
+        autoRetryTimersRef.current.has(job.id)
+      ) {
+        continue;
+      }
+      if (queuedOrScheduled >= MAX_CONCURRENT_AUTO_RETRIES) {
+        break;
+      }
+
+      const delayMs =
+        job.nextRetryDelayMs ??
+        RETRY_BACKOFF_SCHEDULE_MS[attemptsSoFar] ?? 4000;
+      const nextAttempt = attemptsSoFar + 1;
+      const dueAt = Date.now() + delayMs;
+
+      const timer = setTimeout(() => {
+        autoRetryTimersRef.current.delete(job.id);
+        setScheduledRetries((prev) => {
+          if (!(job.id in prev)) {
+            return prev;
+          }
+          const copy = { ...prev };
+          delete copy[job.id];
+          return copy;
+        });
+        if (mountedRef.current) {
+          void handleRetry(job.id);
+        }
+      }, delayMs);
+
+      autoRetryTimersRef.current.set(job.id, timer);
+      queuedOrScheduled += 1;
+      setScheduledRetries((prev) => ({
+        ...prev,
+        [job.id]: { attempt: nextAttempt, delayMs, dueAt },
+      }));
+    }
+  }, [
+    autoRetryEnabled,
+    canRunLiveSim,
+    clearAllAutoRetries,
+    clearScheduledAutoRetry,
+    handleRetry,
+    jobs,
+    session?.role,
+  ]);
+
   const selectedJob = useMemo(() => {
     if (!jobs || jobs.length === 0) {
       return null;
@@ -460,8 +781,18 @@ export function IntegrationDashboard() {
     return jobs.find((item) => item.id === selectedJobId) ?? jobs[0] ?? null;
   }, [jobs, selectedJobId]);
 
-  const activePreset = getActivePreset(stubConfig);
+  const stats = useMemo(() => {
+    const list = jobs ?? [];
+    return {
+      total: list.length,
+      healthy: list.filter((j) => j.status === 'HEALTHY').length,
+      failed: list.filter((j) => j.status === 'FAILED').length,
+      queued: list.filter((j) => j.status === 'QUEUED').length,
+    };
+  }, [jobs]);
+
   const selectedJobPoll: PollState = selectedJob ? (pollStates[selectedJob.id] ?? { kind: 'idle' }) : { kind: 'idle' };
+  const selectedScheduledRetry = selectedJob ? scheduledRetries[selectedJob.id] : undefined;
   const isViewer = session?.role === 'viewer';
   const showStaleBanner = jobs !== null && (isRefreshing || notice.kind === 'server_error');
 
@@ -544,18 +875,87 @@ export function IntegrationDashboard() {
             </button>
           </div>
 
-          <button
-            type="button"
-            className="btn btn--secondary"
-            onClick={() => void handleResetFixtures()}
-          >
-            Reset Fixtures
-          </button>
+          <div className="live-controls">
+            <button
+              type="button"
+              className={`chip-btn live-btn ${canRunLiveSim ? 'live-btn--on' : ''}`}
+              aria-pressed={liveSimEnabled}
+              onClick={() => {
+                setLiveSimEnabled((prev) => {
+                  const next = !prev;
+                  if (!next) {
+                    simAbortRef.current?.abort();
+                    clearAllAutoRetries();
+                  }
+                  return next;
+                });
+              }}
+            >
+              <span className={`live-dot ${canRunLiveSim ? 'live-dot--active' : ''}`} aria-hidden="true" />
+              {liveSimEnabled
+                ? canRunLiveSim
+                  ? `Live Sim: ON${lastTickCount > 0 ? ` (+${lastTickCount}/s)` : ''}`
+                  : 'Live Sim: AUTO-PAUSED'
+                : 'Live Sim: PAUSED'}
+            </button>
+
+            {!isViewer && (
+              <button
+                type="button"
+                className={`chip-btn ${autoRetryEnabled ? 'chip-btn--active' : ''}`}
+                aria-pressed={autoRetryEnabled}
+                onClick={() =>
+                  setAutoRetryEnabled((prev) => {
+                    const next = !prev;
+                    if (!next) {
+                      clearAllAutoRetries();
+                    }
+                    return next;
+                  })
+                }
+              >
+                Auto-Retry 3x: {autoRetryEnabled ? 'ON' : 'OFF'}
+              </button>
+            )}
+
+            <button
+              type="button"
+              className="btn btn--secondary btn--sm"
+              onClick={() => void handleResetFixtures()}
+            >
+              Reset Fixtures
+            </button>
+          </div>
         </div>
       </section>
 
       <main className="main-grid">
         <section className="card" aria-label="Sync Jobs List">
+          <div className="kpi-grid" aria-label="Integration job summary">
+            <div className="kpi-card">
+              <span className="kpi-card__label">Total</span>
+              <strong className="kpi-card__value">{stats.total}</strong>
+            </div>
+            <div className="kpi-card kpi-card--healthy">
+              <span className="kpi-card__label">Healthy</span>
+              <strong className="kpi-card__value">{stats.healthy}</strong>
+            </div>
+            <div className="kpi-card kpi-card--failed">
+              <span className="kpi-card__label">Failed</span>
+              <strong className="kpi-card__value">{stats.failed}</strong>
+            </div>
+            <div className="kpi-card kpi-card--queued">
+              <span className="kpi-card__label">Queued</span>
+              <strong className="kpi-card__value">{stats.queued}</strong>
+            </div>
+          </div>
+
+          <p className="sim-caption">
+            {canRunLiveSim
+              ? `Live feed active while tab is open (1–3 random jobs/s · generated ${totalSimulated}) · Backoff 1s → 2s → 4s (max 3x)`
+              : 'Live feed paused · Auto-retry backoff 1s → 2s → 4s (max 3x)'}
+          </p>
+
           <div className="filter-bar">
             <div className="venue-group" role="group" aria-label="Venue filter">
               <span className="filter-label">Venue:</span>
@@ -705,6 +1105,10 @@ export function IntegrationDashboard() {
                   {jobs?.map((job) => {
                     const isSelected = selectedJob?.id === job.id;
                     const jobPoll = pollStates[job.id];
+                    const scheduled = scheduledRetries[job.id];
+                    const retryCount = job.retryCount ?? 0;
+                    const maxRetries = job.maxRetries ?? MAX_RETRY_ATTEMPTS;
+                    const isExhausted = retryCount >= maxRetries && job.status === 'FAILED';
                     const isBusy =
                       submittingJobIds.has(job.id) ||
                       job.status === 'QUEUED' ||
@@ -734,20 +1138,39 @@ export function IntegrationDashboard() {
                         </td>
                         <td role="cell" data-label="Last Success (UTC)" className="mono">{formatUtcTimestamp(job.lastSuccessAt)}</td>
                         <td role="cell" data-label="Action">
-                          {!isViewer && job.status === 'FAILED' ? (
-                            <button
-                              type="button"
-                              className="btn btn--primary btn--sm"
-                              disabled={isBusy}
-                              onClick={() => void handleRetry(job.id)}
-                            >
-                              {submittingJobIds.has(job.id) ? 'Queueing...' : 'Retry'}
-                            </button>
-                          ) : !isViewer && job.status === 'QUEUED' ? (
-                            <span className="muted-text">Pending</span>
-                          ) : (
-                            <span aria-label="No action available">—</span>
-                          )}
+                          <div className="action-cell">
+                            {!isViewer && job.status === 'FAILED' ? (
+                              isExhausted ? (
+                                <span className="badge--exhausted" title="Maximum 3/3 retries reached">
+                                  Max 3/3
+                                </span>
+                              ) : (
+                                <>
+                                  <button
+                                    type="button"
+                                    className="btn btn--primary btn--sm"
+                                    disabled={isBusy}
+                                    onClick={() => void handleRetry(job.id)}
+                                  >
+                                    {submittingJobIds.has(job.id) ? 'Queueing...' : 'Retry'}
+                                  </button>
+                                  <span className="retry-meta">
+                                    {scheduled
+                                      ? `Auto ${scheduled.attempt}/${maxRetries} · ${formatDelayLabel(scheduled.delayMs)}`
+                                      : retryCount > 0
+                                        ? `${retryCount}/${maxRetries} · Next ${formatDelayLabel(job.nextRetryDelayMs)}`
+                                        : `0/${maxRetries}`}
+                                  </span>
+                                </>
+                              )
+                            ) : !isViewer && job.status === 'QUEUED' ? (
+                              <span className="muted-text">
+                                Pending ({retryCount}/{maxRetries})
+                              </span>
+                            ) : (
+                              <span aria-label="No action available">—</span>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     );
@@ -783,6 +1206,17 @@ export function IntegrationDashboard() {
                   <dt>Last Success</dt>
                   <dd className="mono">{formatUtcTimestamp(selectedJob.lastSuccessAt)}</dd>
                 </div>
+                <div className="detail-meta__row">
+                  <dt>Retries</dt>
+                  <dd className="mono">
+                    {selectedJob.retryCount ?? 0} / {selectedJob.maxRetries ?? MAX_RETRY_ATTEMPTS}
+                    {selectedScheduledRetry
+                      ? ` (Auto #${selectedScheduledRetry.attempt} in ${formatDelayLabel(selectedScheduledRetry.delayMs)})`
+                      : selectedJob.nextRetryDelayMs
+                        ? ` (Next backoff: ${formatDelayLabel(selectedJob.nextRetryDelayMs)})`
+                        : ''}
+                  </dd>
+                </div>
               </dl>
 
               {selectedJob.lastError && (
@@ -796,7 +1230,8 @@ export function IntegrationDashboard() {
                 <div className="poll-box poll-box--active" role="status">
                   <strong>Sync queued — checking status</strong>
                   <span>
-                    Poll {selectedJobPoll.attempt} of {selectedJobPoll.maxAttempts} (max {selectedJobPoll.maxAttempts} checks).
+                    Poll {selectedJobPoll.attempt} of {selectedJobPoll.maxAttempts} · Interval{' '}
+                    {selectedJobPoll.backoffMs}ms (300ms → 600ms → 1200ms → 2400ms).
                   </span>
                 </div>
               )}
@@ -835,14 +1270,20 @@ export function IntegrationDashboard() {
               <div className="detail-actions">
                 {!isViewer ? (
                   selectedJob.status === 'FAILED' ? (
-                    <button
-                      type="button"
-                      className="btn btn--primary btn--full"
-                      disabled={submittingJobIds.has(selectedJob.id) || selectedJobPoll.kind === 'polling'}
-                      onClick={() => void handleRetry(selectedJob.id)}
-                    >
-                      {submittingJobIds.has(selectedJob.id) ? 'Queueing Retry...' : 'Retry Sync'}
-                    </button>
+                    (selectedJob.retryCount ?? 0) >= (selectedJob.maxRetries ?? MAX_RETRY_ATTEMPTS) ? (
+                      <button type="button" className="btn btn--secondary btn--full" disabled>
+                        Max Retries Reached (3/3)
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn btn--primary btn--full"
+                        disabled={submittingJobIds.has(selectedJob.id) || selectedJobPoll.kind === 'polling'}
+                        onClick={() => void handleRetry(selectedJob.id)}
+                      >
+                        {submittingJobIds.has(selectedJob.id) ? 'Queueing Retry...' : 'Retry Sync'}
+                      </button>
+                    )
                   ) : selectedJob.status === 'QUEUED' ? (
                     <button type="button" className="btn btn--secondary btn--full" disabled>
                       Sync Queued (Pending)
@@ -858,13 +1299,9 @@ export function IntegrationDashboard() {
               </div>
 
               <div className="flow-strip" aria-label="Expected retry lifecycle">
-                <span>FAILED</span>
-                <span aria-hidden="true">-&gt;</span>
-                <span>202 QUEUED</span>
-                <span aria-hidden="true">-&gt;</span>
-                <span>Poll (1/2, 2/2)</span>
-                <span aria-hidden="true">-&gt;</span>
-                <span>HEALTHY</span>
+                <span>Backoff: 1s → 2s → 4s (Max 3x)</span>
+                <span aria-hidden="true">|</span>
+                <span>Poll: 0.3s → 0.6s → 1.2s → 2.4s</span>
               </div>
             </>
           ) : (
