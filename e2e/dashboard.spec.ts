@@ -228,4 +228,50 @@ test.describe('Integration Health Dashboard E2E', () => {
     });
     expect(blockedRetry.status()).toBe(409);
   });
+
+  test('8. Pagination activates at 50+ items (50 per page) and remains mobile-friendly', async ({
+    page,
+    request,
+  }) => {
+    await page.goto('/');
+    await expect(page.getByRole('cell', { name: 'Mock POS', exact: true })).toBeVisible();
+
+    await expect(page.getByRole('navigation', { name: 'Jobs pagination' })).toHaveCount(0);
+
+    await page.getByRole('button', { name: /Live Sim:/i }).click();
+    await page.getByRole('button', { name: 'Reset Fixtures' }).click();
+    await expect(page.locator('tbody tr')).toHaveCount(2);
+
+    const seedRes = await request.post('/api/stub/simulate-tick', {
+      headers: { Authorization: 'Bearer operator-A' },
+      data: { venueId: 'ALL', minCount: 55, maxCount: 55 },
+    });
+    expect(seedRes.ok()).toBe(true);
+
+    await page.getByRole('button', { name: 'Refresh' }).click();
+
+    const paginationNav = page.getByRole('navigation', { name: 'Jobs pagination' });
+    await expect(paginationNav).toBeVisible();
+    await expect(paginationNav).toContainText('Showing 1\u201350 of 57 · Page 1 of 2');
+    await expect(page.locator('tbody tr')).toHaveCount(50);
+
+    await paginationNav.getByRole('button', { name: 'Next', exact: true }).click();
+    await expect(paginationNav).toContainText('Showing 51\u201357 of 57 · Page 2 of 2');
+    await expect(page.locator('tbody tr')).toHaveCount(7);
+    await expect(page.getByRole('cell', { name: 'Mock POS', exact: true })).toBeVisible();
+
+    await paginationNav.getByRole('button', { name: 'Previous', exact: true }).click();
+    await expect(paginationNav).toContainText('Showing 1\u201350 of 57 · Page 1 of 2');
+    await expect(page.locator('tbody tr')).toHaveCount(50);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    const hasNoOverflow = await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    );
+    expect(hasNoOverflow).toBe(true);
+
+    await page.getByRole('button', { name: 'Reset Fixtures' }).click();
+    await expect(page.locator('tbody tr')).toHaveCount(2);
+    await expect(page.getByRole('navigation', { name: 'Jobs pagination' })).toHaveCount(0);
+  });
 });

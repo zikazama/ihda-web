@@ -30,6 +30,7 @@ import {
 import { StatusBadge } from './StatusBadge';
 
 export const LIVE_SIM_TICK_MS = 1000;
+export const JOBS_PAGE_SIZE = 50;
 export const MAX_POLL_ATTEMPTS = POLL_BACKOFF_SCHEDULE_MS.length;
 const MAX_CONCURRENT_AUTO_RETRIES = 3;
 
@@ -85,6 +86,7 @@ export function IntegrationDashboard() {
   const [jobs, setJobs] = useState<IntegrationJob[] | null>(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [currentPage, setCurrentPage] = useState<number>(1);
 
   const [isInitialLoading, setIsInitialLoading] = useState<boolean>(true);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
@@ -411,6 +413,7 @@ export function IntegrationDashboard() {
       setSubmittingJobIds(new Set());
       setSelectedVenue('ALL');
       setSelectedJobId(null);
+      setCurrentPage(1);
 
       if (value === 'signed-out') {
         await selectSyntheticSession(null);
@@ -435,6 +438,7 @@ export function IntegrationDashboard() {
       simAbortRef.current?.abort();
       clearAllAutoRetries();
       setSelectedVenue(venue);
+      setCurrentPage(1);
       await loadJobs(venue);
     },
     [clearAllAutoRetries, loadJobs],
@@ -593,6 +597,7 @@ export function IntegrationDashboard() {
     setSubmittingJobIds(new Set());
     setLastTickCount(0);
     setTotalSimulated(0);
+    setCurrentPage(1);
     const result = await resetStubFixtures();
     if (!mountedRef.current) {
       return;
@@ -790,6 +795,23 @@ export function IntegrationDashboard() {
       queued: list.filter((j) => j.status === 'QUEUED').length,
     };
   }, [jobs]);
+
+  const totalJobs = jobs?.length ?? 0;
+  const totalPages = Math.max(1, Math.ceil(totalJobs / JOBS_PAGE_SIZE));
+  const safePage = Math.min(currentPage, totalPages);
+  const pageStartIndex = (safePage - 1) * JOBS_PAGE_SIZE;
+  const paginatedJobs = useMemo(() => {
+    if (!jobs) {
+      return [];
+    }
+    return jobs.slice(pageStartIndex, pageStartIndex + JOBS_PAGE_SIZE);
+  }, [jobs, pageStartIndex]);
+
+  useEffect(() => {
+    if (currentPage > totalPages) {
+      setCurrentPage(totalPages);
+    }
+  }, [currentPage, totalPages]);
 
   const selectedJobPoll: PollState = selectedJob ? (pollStates[selectedJob.id] ?? { kind: 'idle' }) : { kind: 'idle' };
   const selectedScheduledRetry = selectedJob ? scheduledRetries[selectedJob.id] : undefined;
@@ -1102,7 +1124,7 @@ export function IntegrationDashboard() {
                   </tr>
                 </thead>
                 <tbody role="rowgroup">
-                  {jobs?.map((job) => {
+                  {paginatedJobs.map((job) => {
                     const isSelected = selectedJob?.id === job.id;
                     const jobPoll = pollStates[job.id];
                     const scheduled = scheduledRetries[job.id];
@@ -1178,6 +1200,47 @@ export function IntegrationDashboard() {
                 </tbody>
               </table>
             </div>
+          )}
+
+          {!isInitialLoading && totalJobs >= JOBS_PAGE_SIZE && (
+            <nav className="pagination-bar" aria-label="Jobs pagination">
+              <span className="pagination-bar__info">
+                Showing {pageStartIndex + 1}–{Math.min(pageStartIndex + JOBS_PAGE_SIZE, totalJobs)} of {totalJobs} · Page {safePage} of {totalPages}
+              </span>
+              <div className="pagination-bar__controls">
+                <button
+                  type="button"
+                  className="btn btn--secondary btn--sm page-btn"
+                  disabled={safePage <= 1}
+                  onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
+                >
+                  Previous
+                </button>
+                {Array.from({ length: totalPages }, (_, index) => {
+                  const pageNumber = index + 1;
+                  const isActive = pageNumber === safePage;
+                  return (
+                    <button
+                      key={pageNumber}
+                      type="button"
+                      className={`page-btn ${isActive ? 'page-btn--active' : ''}`}
+                      aria-current={isActive ? 'page' : undefined}
+                      onClick={() => setCurrentPage(pageNumber)}
+                    >
+                      {pageNumber}
+                    </button>
+                  );
+                })}
+                <button
+                  type="button"
+                  className="btn btn--secondary btn--sm page-btn"
+                  disabled={safePage >= totalPages}
+                  onClick={() => setCurrentPage((prev) => Math.min(totalPages, prev + 1))}
+                >
+                  Next
+                </button>
+              </div>
+            </nav>
           )}
         </section>
 
